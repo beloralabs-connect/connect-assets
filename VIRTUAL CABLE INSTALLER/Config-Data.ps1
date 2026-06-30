@@ -1,15 +1,26 @@
 <#
 ====================================================================
   Install-VirtualCables.ps1
-  Tout-en-un : auto-elevation, detection, installation, renommage.
+  Tout-en-un : auto-elevation, telechargement, extraction,
+  installation, renommage.
 
-  Cable A = VB-Audio Virtual Cable -> VBCABLE_Setup_x64.exe
-  Cable B = VB-Audio Hi-Fi Cable   -> HiFiCableAsioBridgeSetup.exe
+  Les installeurs ne sont PLUS embarques : ils sont telecharges
+  depuis les sources officielles, puis extraits dans Cable A / B.
+    Cable A = VB-Audio Virtual Cable
+              https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip
+    Cable B = VB-Audio Hi-Fi Cable (ASIO Bridge)
+              http://vincent.burel.free.fr/VirtualAudioApps/HiFiCableAsioBridgeSetup_v1007.zip
 
   Detection : par device PnP (FriendlyName).
   Renommage : prise de possession TrustedInstaller + PKEY_Device_DeviceDesc.
     - Hi-Fi Cable Input  (Render,  VB-Audio Hi-Fi Cable)   -> "Connect Speaker"
     - CABLE Output       (Capture, VB-Audio Virtual Cable) -> "Connect Mic"
+
+  Optimisations :
+    - Add-Type (C#) compile UNE seule fois au demarrage.
+    - Detection PnP mise en cache (1 seul scan, pas 1 par appel).
+    - Effet visuel raccourci (1 s).
+    - Telechargement ignore si le cable est deja installe.
 ====================================================================
 #>
 
@@ -28,18 +39,25 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $ErrorActionPreference = 'Stop'
 $BASE = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-# Suivi : un reboot n'est requis QUE si un driver installe n'est pas encore charge
 $script:RebootNeeded = $false
 
 # -- PKEYs --
 $NAME_PKEY  = '{a45c254e-df1c-4efd-8020-67d146a850e0},2'   # PKEY_Device_DeviceDesc (nom affiche)
 $IFACE_PKEY = '{b3f8fa53-0004-438e-9003-51a46e139bfc},6'   # PKEY_DeviceInterface_FriendlyName (driver)
 
-# -- Config cables --
+# -- Config cables : URL a telecharger + dossier d'extraction + motif de l'exe --
 $Cables = @(
-    @{ Label = 'VB-CABLE'              ; Installer = Join-Path $BASE 'Cable A\VBCABLE_Setup_x64.exe'         ; Pnp = 'VB-Audio Virtual Cable' },
-    @{ Label = 'HiFi Cable ASIO Bridge'; Installer = Join-Path $BASE 'Cable B\HiFiCableAsioBridgeSetup.exe' ; Pnp = 'VB-Audio Hi-Fi Cable'  }
+    @{ Label = 'VB-CABLE'
+       Url   = 'https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip'
+       Dir   = Join-Path $BASE 'Cable A'
+       Exe   = 'VBCABLE_Setup_x64.exe'
+       Pnp   = 'VB-Audio Virtual Cable' },
+
+    @{ Label = 'HiFi Cable ASIO Bridge'
+       Url   = 'http://vincent.burel.free.fr/VirtualAudioApps/HiFiCableAsioBridgeSetup_v1007.zip'
+       Dir   = Join-Path $BASE 'Cable B'
+       Exe   = 'HiFiCableAsioBridgeSetup*.exe'
+       Pnp   = 'VB-Audio Hi-Fi Cable' }
 )
 
 # -- Cibles de renommage --
@@ -48,56 +66,8 @@ $Targets = @(
     [pscustomobject]@{ Slot='mic';     Flow='Capture'; Iface='VB-Audio Virtual Cable'; Names=@('CABLE Output','Connect Mic');          New='Connect Mic' }
 )
 
-# ===== AFFICHAGE =====
-function Write-StepDone {
-    param([string]$Text)
-    Write-Host "  [v] $Text" -ForegroundColor Green -NoNewline
-    Start-Sleep -Seconds 2
-    $blank = ' ' * ($Text.Length + 8)
-    Write-Host "`r$blank`r" -NoNewline
-}
-
-# ===== DETECTION & INSTALLATION =====
-function Test-CableInstalled {
-    param([string]$PnpName)
-    $d = Get-PnpDevice -FriendlyName "*$PnpName*" -ErrorAction SilentlyContinue |
-         Where-Object { $_.Status -eq 'OK' }
-    return [bool]$d
-}
-
-function Install-Cable {
-    param([hashtable]$Cfg)
-
-    if (Test-CableInstalled $Cfg.Pnp) {
-        Write-Host "[OK] $($Cfg.Label) is already installed." -ForegroundColor Cyan
-        return
-    }
-    if (-not (Test-Path $Cfg.Installer)) {
-        Write-Host "[X] File not found: $($Cfg.Installer)" -ForegroundColor Red
-        return
-    }
-
-    Write-Host "Installing $($Cfg.Label)..." -NoNewline
-    Start-Process -FilePath $Cfg.Installer `
-        -ArgumentList '-i', '-h' `
-        -WorkingDirectory (Split-Path $Cfg.Installer) `
-        -Wait | Out-Null
-    Write-Host ""
-
-    if (Test-CableInstalled $Cfg.Pnp) {
-        Write-StepDone "$($Cfg.Label) installed"
-        Write-Host "[OK] $($Cfg.Label) installed." -ForegroundColor Green
-    } else {
-        # Installe mais pas encore charge -> ce cas (et seulement lui) exige un reboot
-        Write-Host "[!] $($Cfg.Label): driver not loaded yet, a restart is required." -ForegroundColor Yellow
-        $script:RebootNeeded = $true
-    }
-}
-
-# ===== RENOMMAGE (prise de possession TrustedInstaller) =====
-function Enable-Privilege {
-    param([string]$Privilege)
-    $sig = @'
+# ===== C# COMPILE UNE SEULE FOIS (sinon recompile a chaque appel = lent) =====
+$tokenManipulatorSig = @'
 using System;
 using System.Runtime.InteropServices;
 public class TokenManipulator {
@@ -115,7 +85,125 @@ public class TokenManipulator {
     }
 }
 '@
-    Add-Type $sig -ErrorAction SilentlyContinue
+if (-not ('TokenManipulator' -as [type])) {
+    Add-Type $tokenManipulatorSig -ErrorAction SilentlyContinue
+}
+
+# ===== AFFICHAGE =====
+function Write-StepDone {
+    param([string]$Text)
+    Write-Host "  [v] $Text" -ForegroundColor Green -NoNewline
+    Start-Sleep -Milliseconds 1000
+    $blank = ' ' * ($Text.Length + 8)
+    Write-Host "`r$blank`r" -NoNewline
+}
+
+# ===== DETECTION (avec cache : 1 seul scan PnP pour toute l'execution) =====
+$script:PnpCache = $null
+function Get-AudioPnpNames {
+    if ($null -eq $script:PnpCache) {
+        $script:PnpCache = @(
+            Get-PnpDevice -Class 'AudioEndpoint','MEDIA' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'OK' } |
+            Select-Object -ExpandProperty FriendlyName
+        )
+    }
+    return $script:PnpCache
+}
+function Reset-PnpCache { $script:PnpCache = $null }
+
+function Test-CableInstalled {
+    param([string]$PnpName)
+    $names = Get-AudioPnpNames
+    foreach ($n in $names) { if ($n -like "*$PnpName*") { return $true } }
+    return $false
+}
+
+# ===== TELECHARGEMENT + EXTRACTION =====
+# Renvoie le chemin de l'exe d'installation, en le telechargeant/extrayant si besoin.
+function Resolve-Installer {
+    param([hashtable]$Cfg)
+
+    # 1) Deja extrait ? on reutilise.
+    if (Test-Path $Cfg.Dir) {
+        $found = Get-ChildItem -Path $Cfg.Dir -Filter $Cfg.Exe -Recurse -File -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+
+    # 2) Telecharger le zip.
+    Write-Host "Downloading $($Cfg.Label)..." -NoNewline
+    New-Item -ItemType Directory -Path $Cfg.Dir -Force | Out-Null
+    $zip = Join-Path $env:TEMP ("vbdl_{0}.zip" -f [IO.Path]::GetRandomFileName())
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11
+        Invoke-WebRequest -Uri $Cfg.Url -OutFile $zip -UseBasicParsing
+        Write-Host " done." -ForegroundColor Green
+    } catch {
+        Write-Host " FAILED." -ForegroundColor Red
+        Write-Host "  [X] Download error ($($Cfg.Url)): $($_.Exception.Message)" -ForegroundColor Red
+        return $null
+    }
+
+    # 3) Extraire dans Cable A / Cable B.
+    Write-Host "Extracting $($Cfg.Label)..." -NoNewline
+    try {
+        Expand-Archive -Path $zip -DestinationPath $Cfg.Dir -Force
+        Write-Host " done." -ForegroundColor Green
+    } catch {
+        Write-Host " FAILED." -ForegroundColor Red
+        Write-Host "  [X] Extract error: $($_.Exception.Message)" -ForegroundColor Red
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+
+    # 4) Localiser l'exe (recursif : certains zip ont un sous-dossier).
+    $found = Get-ChildItem -Path $Cfg.Dir -Filter $Cfg.Exe -Recurse -File -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+    if (-not $found) {
+        Write-Host "  [X] Setup introuvable apres extraction (motif: $($Cfg.Exe))." -ForegroundColor Red
+        return $null
+    }
+    return $found.FullName
+}
+
+# ===== INSTALLATION =====
+function Install-Cable {
+    param([hashtable]$Cfg)
+
+    if (Test-CableInstalled $Cfg.Pnp) {
+        Write-Host "[OK] $($Cfg.Label) is already installed." -ForegroundColor Cyan
+        return
+    }
+
+    $installer = Resolve-Installer $Cfg
+    if (-not $installer) {
+        Write-Host "[X] $($Cfg.Label): installer unavailable, skipping." -ForegroundColor Red
+        return
+    }
+
+    Write-Host "Installing $($Cfg.Label)..." -NoNewline
+    Start-Process -FilePath $installer `
+        -ArgumentList '-i', '-h' `
+        -WorkingDirectory (Split-Path $installer) `
+        -Wait | Out-Null
+    Write-Host ""
+
+    Reset-PnpCache   # un nouveau device est apparu -> rescanner
+    if (Test-CableInstalled $Cfg.Pnp) {
+        Write-StepDone "$($Cfg.Label) installed"
+        Write-Host "[OK] $($Cfg.Label) installed." -ForegroundColor Green
+    } else {
+        Write-Host "[!] $($Cfg.Label): driver not loaded yet, a restart is required." -ForegroundColor Yellow
+        $script:RebootNeeded = $true
+    }
+}
+
+# ===== RENOMMAGE (prise de possession TrustedInstaller) =====
+function Enable-Privilege {
+    param([string]$Privilege)
     [TokenManipulator]::AddPrivilege($Privilege)
 }
 
